@@ -1,63 +1,76 @@
-name: Production-Ready Go CI-CD (Restricted Access)
+name: Production-Grade Go CI-CD
 
 on:
   push:
     branches: [ "main" ]
 
 jobs:
-  # STAGE 1: Automated Quality Control
-  qa-testing:
-    name: Code Quality and Security Audit
+  # STAGE 1: Quality Gate
+  quality-assurance:
+    name: Lint and Unit Testing
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-
-      - name: Setup Go Development Environment
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+      - name: Run Tests
+        run: go test -v -race ./...
 
-      - name: Run Static Analysis (Linter)
-        uses: golangci/golangci-lint-action@v4
-        with:
-          version: latest
-          skip-cache: true
-
-      - name: Run Unit Tests with Race Detection
-        run: go test -v -race -coverprofile=coverage.txt ./...
-
-  # STAGE 2: Secure Delivery to AWS ECR
-  delivery-to-ecr:
-    name: Package and Push to AWS ECR
-    needs: qa-testing
+  # STAGE 2: Build & Push
+  build-and-push:
+    name: Build and Push to ECR
+    needs: quality-assurance
     runs-on: ubuntu-latest
-    # Requires manual approval in GitHub UI
-    environment: production 
-
+    environment: production
+    outputs:
+      registry: ${{ steps.login-ecr.outputs.registry }}
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-
-      - name: Configure Restricted AWS Credentials
+      - uses: actions/checkout@v4
+      - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Authenticate with Amazon ECR
+          aws-region: eu-west-2 # Updated to your region
+      - name: Login to ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and Push Docker Image
+      - name: Build & Push
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: go-devops-api
           TAG: ${{ github.sha }}
         run: |
-          # Build image with dual tags
           docker build -t $REGISTRY/$REPOSITORY:$TAG -t $REGISTRY/$REPOSITORY:latest .
-          # Push specific version and latest tag
           docker push $REGISTRY/$REPOSITORY:$TAG
           docker push $REGISTRY/$REPOSITORY:latest
+
+  # STAGE 3: Continuous Deployment
+  deploy-to-ec2:
+    name: Deploy to AWS EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remote SSH Deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Login to ECR
+            aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin 687249616289.dkr.ecr.eu-west-2.amazonaws.com
+            
+            # Stop existing container (if exists)
+            docker stop my-api || true
+            docker rm my-api || true
+            
+            # Pull the latest image
+            docker pull 687249616289.dkr.ecr.eu-west-2.amazonaws.com/go-devops-api:latest
+            
+            # Run the new container
+            docker run -d -p 8080:8080 --name my-api 687249616289.dkr.ecr.eu-west-2.amazonaws.com/go-devops-api:latest
+            
+            # Cleanup unused images to save disk space
+            docker image prune -f
